@@ -32,7 +32,9 @@ type Observer struct {
 	statusLock sync.Mutex
 	status     []*OutboundStatus
 
-	finished *done.Instance
+	finished     *done.Instance
+	probeCtx     context.Context
+	cancelProbes context.CancelFunc
 
 	ohm        outbound.Manager
 	dispatcher routing.Dispatcher
@@ -47,6 +49,7 @@ func (o *Observer) Type() interface{} {
 }
 
 func (o *Observer) Start() error {
+	o.probeCtx, o.cancelProbes = context.WithCancel(o.ctx)
 	if o.config != nil && len(o.config.SubjectSelector) != 0 {
 		o.finished = done.New()
 		go o.background()
@@ -55,6 +58,9 @@ func (o *Observer) Start() error {
 }
 
 func (o *Observer) Close() error {
+	if o.cancelProbes != nil {
+		o.cancelProbes()
+	}
 	if o.finished != nil {
 		return o.finished.Close()
 	}
@@ -134,35 +140,36 @@ func (o *Observer) clearRemovedOutbounds(outbounds []string) {
 }
 
 func (o *Observer) probe(outbound string) ProbeResult {
+	probeCtx := o.ctx
+	if o.probeCtx != nil {
+		probeCtx = o.probeCtx
+	}
+	probeCtx, cancel := context.WithTimeout(probeCtx, 5*time.Second)
+	defer cancel()
 	errorCollectorForRequest := newErrorCollector()
 
 	httpTransport := http.Transport{
 		Proxy: func(*http.Request) (*url.URL, error) {
 			return nil, nil
 		},
-		DialContext: func(ctx context.Context, network string, addr string) (net.Conn, error) {
-			var connection net.Conn
-			taskErr := task.Run(ctx, func() error {
-				// MUST use Xray's built in context system
-				dest, err := v2net.ParseDestination(network + ":" + addr)
-				if err != nil {
-					return errors.New("cannot understand address").Base(err)
-				}
-				trackedCtx := session.TrackedConnectionError(o.ctx, errorCollectorForRequest)
-				conn, err := tagged.Dialer(trackedCtx, o.dispatcher, dest, outbound)
-				if err != nil {
-					return errors.New("cannot dial remote address ", dest).Base(err)
-				}
-				connection = conn
-				return nil
-			})
-			if taskErr != nil {
-				return nil, errors.New("cannot finish connection").Base(taskErr)
+		DialContext: func(_ context.Context, network string, addr string) (net.Conn, error) {
+			dest, err := v2net.ParseDestination(network + ":" + addr)
+			if err != nil {
+				return nil, errors.New("cannot understand address").Base(err)
 			}
-			return connection, nil
+			// Transport owns the asynchronous dial and closes late connections.
+			// Keep Xray's context values and the probe's cancellation/deadline.
+			trackedCtx := session.TrackedConnectionError(probeCtx, errorCollectorForRequest)
+			conn, err := tagged.Dialer(trackedCtx, o.dispatcher, dest, outbound)
+			if err != nil {
+				return nil, errors.New("cannot dial remote address ", dest).Base(err)
+			}
+			return conn, nil
 		},
 		TLSHandshakeTimeout: time.Second * 5,
+		DisableKeepAlives:   true,
 	}
+	defer httpTransport.CloseIdleConnections()
 	httpClient := &http.Client{
 		Transport: &httpTransport,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -172,13 +179,16 @@ func (o *Observer) probe(outbound string) ProbeResult {
 		Timeout: time.Second * 5,
 	}
 	var GETTime time.Duration
-	err := task.Run(o.ctx, func() error {
+	err := task.Run(probeCtx, func() error {
 		startTime := time.Now()
 		probeURL := "https://www.google.com/generate_204"
 		if o.config.ProbeUrl != "" {
 			probeURL = o.config.ProbeUrl
 		}
-		req, _ := http.NewRequest(http.MethodGet, probeURL, nil)
+		req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, probeURL, nil)
+		if err != nil {
+			return errors.New("cannot create probe request").Base(err)
+		}
 		utils.TryDefaultHeadersWith(req.Header, "nav")
 		response, err := httpClient.Do(req)
 		if err != nil {
